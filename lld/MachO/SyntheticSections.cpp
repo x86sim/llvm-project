@@ -2617,6 +2617,13 @@ void ChainedFixupsSection::finalizeContents() {
     }
   }
 
+  // A multi-start page's entry holds the index of its first start in the
+  // overflow list in 15 bits. ld64 also refuses to link past that.
+  for (const SegmentInfo &seg : fixupSegments)
+    if (seg.pageStartCount() > DYLD_CHAINED_PTR_START_MULTI)
+      error("too many chained fixup starts in segment " + seg.oseg->name +
+            " for 32-bit chained fixups. Re-link with -no_fixup_chains");
+
   // Compute expected encoded size.
   size = alignTo<8>(sizeof(dyld_chained_fixups_header));
   size += alignTo<8>(offsetof(dyld_chained_starts_in_image, seg_info_offset) +
