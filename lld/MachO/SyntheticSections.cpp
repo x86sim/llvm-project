@@ -343,9 +343,39 @@ void NonLazyPointerSectionBase::addEntry(Symbol *sym) {
   }
 }
 
+// DYLD_CHAINED_PTR_32 (arm64_32). Both entry kinds are one little-endian
+// uint32_t:
+//   rebase: target:26 (vmaddr), next:5, bind:1 (= 0)
+//   bind:   ordinal:20, addend:6, next:5, bind:1 (= 1)
+// "next" counts 4-byte strides, so links span at most 31 * 4 bytes; a page whose
+// fixups are further apart gets several chain starts (DYLD_CHAINED_PTR_START_MULTI).
+// A rebase target above max_valid_pointer means a non-pointer value to dyld, so
+// every pointer target must be at or below it. ld64 sets it to the end of the
+// image rounded up to 1 MiB.
+static constexpr uint32_t chained32MaxNext = 31;
+static constexpr uint32_t chained32MaxInlineAddend = 63;
+
+static uint64_t chained32MaxValidPointer() {
+  uint64_t end = 0;
+  for (const OutputSegment *seg : outputSegments)
+    end = std::max(end, seg->addr + seg->vmSize);
+  return alignTo(end, 0x100000);
+}
+
+static bool chainedFixups32() { return target->wordSize == 4; }
+
 void macho::writeChainedRebase(uint8_t *buf, uint64_t targetVA) {
   assert(config->emitChainedFixups);
-  assert(target->wordSize == 8 && "Only 64-bit platforms are supported");
+  if (chainedFixups32()) {
+    uint64_t maxValid = chained32MaxValidPointer();
+    if (targetVA > maxValid || !isUInt<26>(targetVA))
+      error("rebase target address 0x" + Twine::utohexstr(targetVA) +
+            " does not fit into a 32-bit chained fixup. Re-link with "
+            "-no_fixup_chains");
+    write32le(buf, static_cast<uint32_t>(targetVA & 0x3ff'ffff));
+    return;
+  }
+  assert(target->wordSize == 8 && "Only 32- and 64-bit platforms are supported");
   auto *rebase = reinterpret_cast<dyld_chained_ptr_64_rebase *>(buf);
   rebase->target = targetVA & 0xf'ffff'ffff;
   rebase->high8 = (targetVA >> 56);
@@ -363,7 +393,16 @@ void macho::writeChainedRebase(uint8_t *buf, uint64_t targetVA) {
 
 static void writeChainedBind(uint8_t *buf, const Symbol *sym, int64_t addend) {
   assert(config->emitChainedFixups);
-  assert(target->wordSize == 8 && "Only 64-bit platforms are supported");
+  if (chainedFixups32()) {
+    auto [ordinal, inlineAddend] = in.chainedFixups->getBinding(sym, addend);
+    if (!isUInt<20>(ordinal))
+      error("too many imports for 32-bit chained fixups. Re-link with "
+            "-no_fixup_chains");
+    write32le(buf, (ordinal & 0xfffff) |
+                       (uint32_t(inlineAddend & 0x3f) << 20) | (1u << 31));
+    return;
+  }
+  assert(target->wordSize == 8 && "Only 32- and 64-bit platforms are supported");
   auto *bind = reinterpret_cast<dyld_chained_ptr_64_bind *>(buf);
   auto [ordinal, inlineAddend] = in.chainedFixups->getBinding(sym, addend);
   bind->ordinal = ordinal;
@@ -386,8 +425,12 @@ void NonLazyPointerSectionBase::writeTo(uint8_t *buf) const {
       writeChainedFixup(&buf[i * target->wordSize], entry, 0);
   } else {
     for (const auto &[i, entry] : llvm::enumerate(entries))
-      if (auto *defined = dyn_cast<Defined>(entry))
-        write64le(&buf[i * target->wordSize], defined->getVA());
+      if (auto *defined = dyn_cast<Defined>(entry)) {
+        if (target->wordSize == 4)
+          write32le(&buf[i * target->wordSize], defined->getVA());
+        else
+          write64le(&buf[i * target->wordSize], defined->getVA());
+      }
   }
 }
 
@@ -2314,7 +2357,7 @@ void ChainedFixupsSection::addBinding(const Symbol *sym,
                                       const InputSection *isec, uint64_t offset,
                                       int64_t addend) {
   locations.emplace_back(isec, offset);
-  int64_t outlineAddend = (addend < 0 || addend > 0xFF) ? addend : 0;
+  int64_t outlineAddend = (addend < 0 || addend > maxInlineAddend()) ? addend : 0;
   auto [it, inserted] = bindings.insert(
       {{sym, outlineAddend}, static_cast<uint32_t>(bindings.size())});
 
@@ -2330,7 +2373,7 @@ void ChainedFixupsSection::addBinding(const Symbol *sym,
 
 std::pair<uint32_t, uint8_t>
 ChainedFixupsSection::getBinding(const Symbol *sym, int64_t addend) const {
-  int64_t outlineAddend = (addend < 0 || addend > 0xFF) ? addend : 0;
+  int64_t outlineAddend = (addend < 0 || addend > maxInlineAddend()) ? addend : 0;
   auto it = bindings.find({sym, outlineAddend});
   assert(it != bindings.end() && "binding not found in the imports table");
   if (outlineAddend == 0)
@@ -2369,10 +2412,36 @@ static size_t writeImport(uint8_t *buf, int format, int16_t libOrdinal,
   }
 }
 
+bool ChainedFixupsSection::chainNextFits(uint64_t delta) {
+  return !chainedFixups32() || delta <= chained32MaxNext * 4;
+}
+
+int64_t ChainedFixupsSection::maxInlineAddend() {
+  return chainedFixups32() ? chained32MaxInlineAddend : 0xFF;
+}
+
+// page_start has one entry per page. With 32-bit chains a page may have several
+// starts; its entry then holds DYLD_CHAINED_PTR_START_MULTI | index of its first
+// start in an overflow list after the per-page entries, and the page's last start
+// in that list carries DYLD_CHAINED_PTR_START_LAST.
+size_t ChainedFixupsSection::SegmentInfo::pageStartCount() const {
+  size_t count = pageStarts.back().first + 1;
+  for (size_t i = 0; i < pageStarts.size();) {
+    size_t j = i + 1;
+    while (j < pageStarts.size() && pageStarts[j].first == pageStarts[i].first)
+      ++j;
+    if (j - i > 1)
+      count += j - i;
+    i = j;
+  }
+  return count;
+}
+
 size_t ChainedFixupsSection::SegmentInfo::getSize() const {
   assert(pageStarts.size() > 0 && "SegmentInfo for segment with no fixups?");
+  // sizeof(dyld_chained_starts_in_segment) includes the first page_start entry.
   return alignTo<8>(sizeof(dyld_chained_starts_in_segment) +
-                    pageStarts.back().first * sizeof(uint16_t));
+                    (pageStartCount() - 1) * sizeof(uint16_t));
 }
 
 size_t ChainedFixupsSection::SegmentInfo::writeTo(uint8_t *buf) const {
@@ -2380,17 +2449,34 @@ size_t ChainedFixupsSection::SegmentInfo::writeTo(uint8_t *buf) const {
   segInfo->size = getSize();
   segInfo->page_size = target->getPageSize();
   // FIXME: Use DYLD_CHAINED_PTR_64_OFFSET on newer OS versions.
-  segInfo->pointer_format = DYLD_CHAINED_PTR_64;
+  segInfo->pointer_format =
+      chainedFixups32() ? DYLD_CHAINED_PTR_32 : DYLD_CHAINED_PTR_64;
   segInfo->segment_offset = oseg->addr - in.header->addr;
-  segInfo->max_valid_pointer = 0; // not used on 64-bit
+  // Only used by 32-bit formats.
+  segInfo->max_valid_pointer = chainedFixups32() ? chained32MaxValidPointer() : 0;
   segInfo->page_count = pageStarts.back().first + 1;
 
   uint16_t *starts = segInfo->page_start;
   for (size_t i = 0; i < segInfo->page_count; ++i)
     starts[i] = DYLD_CHAINED_PTR_START_NONE;
 
-  for (auto [pageIdx, startAddr] : pageStarts)
-    starts[pageIdx] = startAddr;
+  size_t overflow = segInfo->page_count;
+  for (size_t i = 0; i < pageStarts.size();) {
+    size_t j = i + 1;
+    while (j < pageStarts.size() && pageStarts[j].first == pageStarts[i].first)
+      ++j;
+    uint16_t pageIdx = pageStarts[i].first;
+    if (j - i == 1) {
+      starts[pageIdx] = pageStarts[i].second;
+    } else {
+      starts[pageIdx] = DYLD_CHAINED_PTR_START_MULTI | overflow;
+      for (size_t k = i; k < j; ++k)
+        starts[overflow++] = pageStarts[k].second;
+      starts[overflow - 1] |= DYLD_CHAINED_PTR_START_LAST;
+    }
+    i = j;
+  }
+  assert(overflow == pageStartCount());
   return segInfo->size;
 }
 
@@ -2475,7 +2561,8 @@ void ChainedFixupsSection::writeTo(uint8_t *buf) const {
 // This is step 2 of the algorithm described in the class comment of
 // ChainedFixupsSection.
 void ChainedFixupsSection::finalizeContents() {
-  assert(target->wordSize == 8 && "Only 64-bit platforms are supported");
+  assert((target->wordSize == 8 || target->wordSize == 4) &&
+         "Only 32- and 64-bit platforms are supported");
   assert(config->emitChainedFixups);
 
   if (!isUInt<32>(symtabSize))
@@ -2520,8 +2607,13 @@ void ChainedFixupsSection::finalizeContents() {
           pageIdx, locations[i].offset % pageSize);
       ++i;
       while (i < count && sameSegment(locations[i], firstLoc) &&
-             locations[i].offset / pageSize == pageIdx)
+             locations[i].offset / pageSize == pageIdx) {
+        // A 32-bit chain cannot link fixups this far apart: start a new one.
+        if (!chainNextFits(locations[i].offset - locations[i - 1].offset))
+          fixupSegments.back().pageStarts.emplace_back(
+              pageIdx, locations[i].offset % pageSize);
         ++i;
+      }
     }
   }
 

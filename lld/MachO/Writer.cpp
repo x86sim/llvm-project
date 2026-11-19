@@ -1255,7 +1255,7 @@ void Writer::buildFixupChains() {
   TimeTraceScope timeScope("Build fixup chains");
 
   const uint64_t pageSize = target->getPageSize();
-  constexpr uint32_t stride = 4; // for DYLD_CHAINED_PTR_64
+  constexpr uint32_t stride = 4; // for DYLD_CHAINED_PTR_64 and _32
 
   for (size_t i = 0, count = loc.size(); i < count;) {
     const OutputSegment *oseg = loc[i].isec->parent->parent;
@@ -1281,9 +1281,22 @@ void Writer::buildFixupChains() {
             "fixups are unaligned (offset " + Twine(offset) +
             " is not a multiple of the stride). Re-link with -no_fixup_chains");
 
+      // finalizeContents() started a new chain here.
+      if (!ChainedFixupsSection::chainNextFits(offset)) {
+        ++i;
+        continue;
+      }
+
       // The "next" field is in the same location for bind and rebase entries.
-      reinterpret_cast<dyld_chained_ptr_64_bind *>(buf + loc[i - 1].offset)
-          ->next = offset / stride;
+      if (target->wordSize == 4) {
+        uint8_t *prev = buf + loc[i - 1].offset;
+        support::endian::write32le(
+            prev, (support::endian::read32le(prev) & ~(0x1fu << 26)) |
+                            (uint32_t(offset / stride) << 26));
+      } else {
+        reinterpret_cast<dyld_chained_ptr_64_bind *>(buf + loc[i - 1].offset)
+            ->next = offset / stride;
+      }
       ++i;
     }
   }

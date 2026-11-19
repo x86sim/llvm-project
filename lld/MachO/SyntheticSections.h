@@ -805,6 +805,14 @@ public:
 
   const std::vector<Location> &getLocations() const { return locations; }
 
+  // Whether the "next" field can link two fixups `delta` bytes apart. Always
+  // true for 64-bit chains (12-bit next, within one page); 32-bit chains reach
+  // at most 31 strides of 4 bytes.
+  static bool chainNextFits(uint64_t delta);
+  // The largest bind addend stored in the chain entry itself; larger (or
+  // negative) addends go into the imports table.
+  static int64_t maxInlineAddend();
+
   bool hasWeakBinding() const { return hasWeakBind; }
   bool hasNonWeakDefinition() const { return hasNonWeakDef; }
 
@@ -819,11 +827,14 @@ private:
     SegmentInfo(const OutputSegment *oseg) : oseg(oseg) {}
 
     const OutputSegment *oseg;
-    // (page index, fixup starts offset)
+    // (page index, fixup starts offset); 32-bit chains may have several
+    // starts for one page, in ascending order.
     llvm::SmallVector<std::pair<uint16_t, uint16_t>> pageStarts;
 
     size_t getSize() const;
     size_t writeTo(uint8_t *buf) const;
+    // page_start entries including the 32-bit multi-start overflow list.
+    size_t pageStartCount() const;
   };
   llvm::SmallVector<SegmentInfo, 4> fixupSegments;
 
